@@ -100,6 +100,49 @@ jobs:
           $target = 'desktop/lib/widgets/web_pane_panel.dart'
           $report = Join-Path $env:RUNNER_TEMP 'webview2-smoke'
           New-Item -ItemType Directory -Path $report -Force | Out-Null
+          $generatedPluginFiles = @(
+            'desktop/linux/flutter/generated_plugin_registrant.cc',
+            'desktop/linux/flutter/generated_plugin_registrant.h',
+            'desktop/linux/flutter/generated_plugins.cmake',
+            'desktop/macos/Flutter/GeneratedPluginRegistrant.swift',
+            'desktop/windows/flutter/generated_plugin_registrant.cc',
+            'desktop/windows/flutter/generated_plugin_registrant.h',
+            'desktop/windows/flutter/generated_plugins.cmake'
+          )
+
+          function Assert-ProofCheckout([string]$Stage, [string]$AllowedChange = '') {
+            $checkoutStatus = @(git status --short --untracked-files=all)
+            if ($LASTEXITCODE -ne 0) { throw "Could not inspect proof checkout $Stage." }
+
+            # Flutter writes these tracked registrants with LF even when Git checked them out as CRLF.
+            $restore = @()
+            foreach ($file in $generatedPluginFiles) {
+              if ($checkoutStatus -ccontains " M $file") {
+                $committed = git rev-parse "HEAD:$file"
+                if ($LASTEXITCODE -ne 0) { throw "Could not read the committed blob for $file." }
+                $generated = git hash-object --no-filters -- $file
+                if ($LASTEXITCODE -ne 0) { throw "Could not read the generated file $file." }
+                if ($generated -ceq $committed) { $restore += $file }
+              }
+            }
+            if ($restore.Count -gt 0) {
+              git restore --source HEAD --worktree -- @restore
+              if ($LASTEXITCODE -ne 0) { throw "Could not restore generated line endings $Stage." }
+              Write-Host "Restored checkout line endings for $($restore -join ', ')"
+              $checkoutStatus = @(git status --short --untracked-files=all)
+              if ($LASTEXITCODE -ne 0) { throw "Could not inspect proof checkout $Stage after restoring line endings." }
+            }
+
+            $expectedStatus = if ($AllowedChange) { " M $AllowedChange" } else { '' }
+            if (($checkoutStatus -join "`n") -cne $expectedStatus) {
+              Write-Host "Unexpected checkout changes $Stage"
+              $checkoutStatus | Write-Host
+              git --no-pager diff --relative --no-ext-diff --no-color --
+              git --no-pager diff --cached --relative --no-ext-diff --no-color --
+              git ls-files --eol -- desktop/pubspec.lock
+              throw "Unexpected proof checkout changes $Stage."
+            }
+          }
 
           function Set-ProofProfile([string]$Label) {
             $env:FLUTTER_TEST = '1'
@@ -111,14 +154,10 @@ jobs:
             Remove-Item Env:HARNESS_DESKTOP_PIPE_IO_DLL -ErrorAction SilentlyContinue
           }
 
-          if (@(git status --porcelain).Count -ne 0) { throw 'Dirty proof checkout before baseline.' }
+          Assert-ProofCheckout 'before baseline'
           git restore --source $env:OLD_HEAD --worktree -- $target
-          $restoreExit = $LASTEXITCODE
-          $baselineChanges = @(git diff --name-only)
-          if ($restoreExit -ne 0 -or $LASTEXITCODE -ne 0 -or
-              $baselineChanges.Count -ne 1 -or $baselineChanges[0] -ne $target) {
-            throw 'Failed to isolate the single old Dart module.'
-          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not restore the old Dart module.' }
+          Assert-ProofCheckout 'after selecting the old module' $target
           try {
             Set-ProofProfile 'old'
             Push-Location (Join-Path $repo 'desktop')
@@ -135,12 +174,10 @@ jobs:
               throw 'Old production module did not reproduce the reported native adapter error.'
             }
           } finally {
-            $remaining = @(git diff --name-only)
-            if ($remaining.Count -ne 1 -or $remaining[0] -ne $target) { throw 'Unexpected checkout changes during baseline.' }
+            Assert-ProofCheckout 'during baseline' $target
             git restore --source $env:FIXED_HEAD --worktree -- $target
-            if ($LASTEXITCODE -ne 0 -or @(git status --porcelain).Count -ne 0) {
-              throw 'Could not restore the exact candidate source.'
-            }
+            if ($LASTEXITCODE -ne 0) { throw 'Could not restore the exact candidate source.' }
+            Assert-ProofCheckout 'after restoring the candidate'
           }
 
           Set-ProofProfile 'fixed'
@@ -164,6 +201,7 @@ jobs:
           if (-not $visible -and -not (Select-String -Quiet -Path $fixedLog -SimpleMatch 'WEBVIEW2_PROOF_PIXELS_INCONCLUSIVE:')) {
             throw 'Visibility check supplied neither proof nor an inconclusive reason.'
           }
+          Assert-ProofCheckout 'after candidate replay'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
