@@ -1,0 +1,152 @@
+name: Disposable Windows WebView2 proof
+on:
+  push:
+    branches: [codex/windows-webview2-native-smoke]
+
+permissions:
+  contents: read
+
+jobs:
+  native-smoke:
+    if: github.repository == 'XSY-28/openharness'
+    runs-on: windows-2025
+    timeout-minutes: 25
+    env:
+      FIXED_HEAD: 176da2a12a0c270479e05dd46f0678280e514dd2
+      OLD_HEAD: 70cb3eb647df0552a088fb1fa2e09c05524d2d16
+      FLUTTER_VERSION: '3.47.2'
+      FLUTTER_SUPPRESS_ANALYTICS: 'true'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Verify the fixture changes and runtime
+        shell: pwsh
+        run: |
+          $fixturePaths = @(
+            '.github/workflows/windows-webview2-smoke.yml',
+            'desktop/integration_test/windows_webview2_smoke.dart',
+            'desktop/tool/windows_webview2_pane_capture.ps1'
+          )
+          $fixPaths = @(
+            'desktop/RELEASE.md',
+            'desktop/lib/widgets/web_pane_panel.dart',
+            'desktop/test/web_pane_windows_test.dart',
+            'docs/windows-rules.md'
+          )
+          if (@(git status --porcelain).Count -ne 0) { throw 'Proof checkout is dirty.' }
+          $proofPaths = @(git diff --name-only $env:FIXED_HEAD HEAD)
+          if ($LASTEXITCODE -ne 0 -or (Compare-Object $fixturePaths $proofPaths)) {
+            throw 'Proof commit differs from the named candidate outside the smoke fixtures.'
+          }
+          $changedProduct = @(git diff --name-only $env:OLD_HEAD $env:FIXED_HEAD)
+          if ($LASTEXITCODE -ne 0 -or (Compare-Object $fixPaths $changedProduct)) {
+            throw 'The baseline is unsuitable for an incremental one-module Dart replay.'
+          }
+          Write-Host "Fixture $env:GITHUB_SHA, candidate $env:FIXED_HEAD, baseline $env:OLD_HEAD"
+          $reg = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $runtime = (Get-ItemProperty -LiteralPath $reg -Name pv -ErrorAction SilentlyContinue).pv
+          $harnessProbe = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\EdgeWebView\Application'
+          if (-not $runtime -or [version]$runtime -eq [version]'0.0.0.0' -or
+              -not (Test-Path -LiteralPath $harnessProbe -PathType Container)) {
+            throw 'Native smoke inconclusive: a machine WebView2 Runtime is required for the new isolated profile.'
+          }
+          Write-Host "Machine WebView2 Runtime: $runtime"
+          Write-Host "Runner capture session: $((Get-Process -Id $PID).SessionId)"
+      - name: Install the repository Flutter pin
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          git clone --depth 1 --branch "$env:FLUTTER_VERSION" https://github.com/flutter/flutter.git flutter
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Flutter clone failed.' }
+          "$env:RUNNER_TEMP\flutter\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Resolve the locked desktop dependencies
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          $version = flutter --version --machine | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $version.frameworkVersion -ne $env:FLUTTER_VERSION) {
+            throw 'Unexpected Flutter version.'
+          }
+          flutter pub get --enforce-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Locked desktop dependency setup failed.' }
+      - name: Replay the old viewer, then the exact candidate
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $repo = (Get-Location).Path
+          $target = 'desktop/lib/widgets/web_pane_panel.dart'
+          $report = Join-Path $env:RUNNER_TEMP 'webview2-smoke'
+          New-Item -ItemType Directory -Path $report | Out-Null
+
+          function Set-ProofProfile([string]$Label) {
+            $env:FLUTTER_TEST = '1'
+            $env:HARNESS_DESKTOP_INSTANCE = "viewer-proof-$env:GITHUB_RUN_ID-$Label"
+            $env:USERPROFILE = Join-Path $env:RUNNER_TEMP "viewer-profile-$env:GITHUB_RUN_ID-$Label"
+            $env:APPDATA = Join-Path $env:USERPROFILE 'AppData\Roaming'
+            $env:LOCALAPPDATA = Join-Path $env:USERPROFILE 'AppData\Local'
+            New-Item -ItemType Directory -Path $env:APPDATA,$env:LOCALAPPDATA -Force | Out-Null
+            Remove-Item Env:HARNESS_DESKTOP_PIPE_IO_DLL -ErrorAction SilentlyContinue
+          }
+
+          if (@(git status --porcelain).Count -ne 0) { throw 'Dirty proof checkout before baseline.' }
+          git restore --source $env:OLD_HEAD --worktree -- $target
+          $restoreExit = $LASTEXITCODE
+          $baselineChanges = @(git diff --name-only)
+          if ($restoreExit -ne 0 -or $LASTEXITCODE -ne 0 -or
+              $baselineChanges.Count -ne 1 -or $baselineChanges[0] -ne $target) {
+            throw 'Failed to isolate the single old Dart module.'
+          }
+          try {
+            Set-ProofProfile 'old'
+            Push-Location (Join-Path $repo 'desktop')
+            try {
+              $oldLog = Join-Path $report 'old.log'
+              flutter test -d windows --no-pub --reporter expanded integration_test/windows_webview2_smoke.dart *>&1 |
+                Tee-Object -FilePath $oldLog
+              $oldExit = $LASTEXITCODE
+            } finally { Pop-Location }
+            if ($oldExit -eq 0 -or
+                -not (Select-String -Quiet -Path $oldLog -SimpleMatch 'WEBVIEW2_PROOF_NATIVE_ADAPTER_READY') -or
+                -not (Select-String -Quiet -Path $oldLog -SimpleMatch 'setOnUrlChange is not implemented on the current platform.') -or
+                (Select-String -Quiet -Path $oldLog -SimpleMatch 'WEBVIEW2_PROOF_NATIVE_LOAD_ADDRESS_AND_DOM_OK')) {
+              throw 'Old production module did not reproduce the reported native adapter error.'
+            }
+          } finally {
+            $remaining = @(git diff --name-only)
+            if ($remaining.Count -ne 1 -or $remaining[0] -ne $target) { throw 'Unexpected checkout changes during baseline.' }
+            git restore --source $env:FIXED_HEAD --worktree -- $target
+            if ($LASTEXITCODE -ne 0 -or @(git status --porcelain).Count -ne 0) {
+              throw 'Could not restore the exact candidate source.'
+            }
+          }
+
+          Set-ProofProfile 'fixed'
+          $env:HARNESS_WEBVIEW2_PROOF_CAPTURE = Join-Path $repo 'desktop\tool\windows_webview2_pane_capture.ps1'
+          $env:HARNESS_WEBVIEW2_PROOF_SCREENSHOT = Join-Path $report 'visible-viewer.png'
+          Push-Location (Join-Path $repo 'desktop')
+          try {
+            $fixedLog = Join-Path $report 'fixed.log'
+            flutter test -d windows --no-pub --reporter expanded integration_test/windows_webview2_smoke.dart *>&1 |
+              Tee-Object -FilePath $fixedLog
+            $fixedExit = $LASTEXITCODE
+          } finally { Pop-Location }
+          if ($fixedExit -ne 0 -or
+              -not (Select-String -Quiet -Path $fixedLog -SimpleMatch 'WEBVIEW2_PROOF_NATIVE_LOAD_ADDRESS_AND_DOM_OK')) {
+            throw 'Candidate did not demonstrate native page load, navigation and DOM.'
+          }
+          $visible = Test-Path -LiteralPath $env:HARNESS_WEBVIEW2_PROOF_SCREENSHOT -PathType Leaf
+          if ($visible -and -not (Select-String -Quiet -Path $fixedLog -SimpleMatch 'WEBVIEW2_PROOF_VISIBLE_PIXELS_OK')) {
+            throw 'Unverified screenshot unexpectedly present.'
+          }
+          if (-not $visible -and -not (Select-String -Quiet -Path $fixedLog -SimpleMatch 'WEBVIEW2_PROOF_PIXELS_INCONCLUSIVE:')) {
+            throw 'Visibility check supplied neither proof nor an inconclusive reason.'
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: webview2-native-smoke
+          path: ${{ runner.temp }}/webview2-smoke/
+          if-no-files-found: warn
+          retention-days: 7
