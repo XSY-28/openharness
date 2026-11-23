@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 3
+          fetch-depth: 10
           persist-credentials: false
       - name: Verify the fixture changes and runtime
         shell: pwsh
@@ -65,12 +65,33 @@ jobs:
         shell: pwsh
         working-directory: desktop
         run: |
-          $version = flutter --version --machine | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $version.frameworkVersion -ne $env:FLUTTER_VERSION) {
-            throw 'Unexpected Flutter version.'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $report = Join-Path $env:RUNNER_TEMP 'webview2-smoke'
+          New-Item -ItemType Directory -Path $report -Force | Out-Null
+          $flutter = Join-Path $env:RUNNER_TEMP 'flutter\bin\flutter.bat'
+          if (-not (Test-Path -LiteralPath $flutter -PathType Leaf)) { throw 'Pinned Flutter launcher missing.' }
+
+          function Invoke-LockedSdk([string]$Name, [string[]]$FlutterArguments) {
+            $stdout = Join-Path $report "flutter-$Name.stdout.log"
+            $stderr = Join-Path $report "flutter-$Name.stderr.log"
+            & $flutter @FlutterArguments 1> $stdout 2> $stderr
+            $status = $LASTEXITCODE
+            $output = Get-Content -LiteralPath $stdout -Raw
+            Write-Host "Flutter $Name exit code: $status"
+            Write-Host "stdout:`n$output"
+            Write-Host "stderr:`n$(Get-Content -LiteralPath $stderr -Raw)"
+            if ($status -ne 0) { throw "Flutter $Name failed with exit code $status." }
+            return $output
           }
-          flutter pub get --enforce-lockfile
-          if ($LASTEXITCODE -ne 0) { throw 'Locked desktop dependency setup failed.' }
+
+          # The cold batch launcher can print SDK and pub bootstrapping output before the Flutter tool runs.
+          [void](Invoke-LockedSdk 'warmup' @('--version'))
+          $rawVersion = Invoke-LockedSdk 'version' @('--version', '--machine')
+          $version = ConvertFrom-Json -InputObject $rawVersion -ErrorAction Stop
+          if ($version.frameworkVersion -ne $env:FLUTTER_VERSION) {
+            throw "Flutter version '$($version.frameworkVersion)' did not match $env:FLUTTER_VERSION."
+          }
+          [void](Invoke-LockedSdk 'pub-get' @('pub', 'get', '--enforce-lockfile'))
       - name: Replay the old viewer, then the exact candidate
         shell: pwsh
         run: |
@@ -78,7 +99,7 @@ jobs:
           $repo = (Get-Location).Path
           $target = 'desktop/lib/widgets/web_pane_panel.dart'
           $report = Join-Path $env:RUNNER_TEMP 'webview2-smoke'
-          New-Item -ItemType Directory -Path $report | Out-Null
+          New-Item -ItemType Directory -Path $report -Force | Out-Null
 
           function Set-ProofProfile([string]$Label) {
             $env:FLUTTER_TEST = '1'
